@@ -7,6 +7,8 @@ StageGuard - 무대 설비 작업 위험성 평가 및 동선 시뮬레이터
 """
 
 import io
+import os
+import re
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
@@ -550,11 +552,173 @@ def get_sample_tasks() -> list[dict]:
     ]
 
 
+# ------------------------------------------------------------------------------
+# Supabase 연동 (클라우드 저장소). 미설정/오류 시 자동으로 로컬(세션) 모드로 동작합니다.
+# 테이블: risk_assessments (task_name, x_coord, y_coord, likelihood, severity,
+#                           risk_score, risk_grade, memo)
+# memo 형식: "[작업분류|위험요소] 상세내용"  (모바일 앱 등 다른 클라이언트가 넣은
+#            일반 메모도 그대로 읽을 수 있습니다)
+# ------------------------------------------------------------------------------
+DB_TABLE = "risk_assessments"
+GRADE_DB_LABEL = {"Red": "Red (고위험)", "Yellow": "Yellow (중위험)", "Green": "Green (저위험)"}
+
+
+@st.cache_resource(show_spinner=False)
+def get_supabase():
+    """Supabase 클라이언트를 반환합니다. 설정이 없거나 실패하면 None."""
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+    except Exception:
+        url = os.environ.get("SUPABASE_URL", "")
+        key = os.environ.get("SUPABASE_KEY", "")
+    if not url or not key:
+        return None
+    try:
+        from supabase import create_client
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+def db_active() -> bool:
+    """Supabase가 연결되어 있고 조회에 성공한 상태인지 여부"""
+    return get_supabase() is not None and st.session_state.get("db_ok", False)
+
+
+def _row_to_task(row: dict, idx: int) -> dict:
+    memo = str(row.get("memo") or "")
+    m = re.match(r"^\[(.*?)\|(.*?)\]\s*(.*)$", memo, re.S)
+    if m:
+        task_type, hazard, desc = m.group(1), m.group(2), m.group(3)
+    else:
+        task_type, hazard, desc = "기타", "기타 일반 위험", memo
+    likelihood = int(row.get("likelihood") or 1)
+    severity = int(row.get("severity") or 1)
+    score, grade, _, _ = calculate_risk(likelihood, severity)
+    return {
+        "id": row.get("id"),
+        "step_no": idx,
+        "task_name": str(row.get("task_name") or ""),
+        "task_type": task_type,
+        "hazard_element": hazard,
+        "x_coord": float(row.get("x_coord") or 0.0),
+        "y_coord": float(row.get("y_coord") or 0.0),
+        "likelihood": likelihood,
+        "severity": severity,
+        "risk_score": score,
+        "risk_grade": grade,
+        "description": desc,
+    }
+
+
+def _task_to_row(task: dict) -> dict:
+    score, grade, _, _ = calculate_risk(task["likelihood"], task["severity"])
+    desc = task.get("description", "") or ""
+    memo = f"[{task.get('task_type', '기타')}|{task.get('hazard_element', '기타 일반 위험')}] {desc}".strip()
+    return {
+        "task_name": task["task_name"],
+        "x_coord": float(task["x_coord"]),
+        "y_coord": float(task["y_coord"]),
+        "likelihood": int(task["likelihood"]),
+        "severity": int(task["severity"]),
+        "risk_score": int(score),
+        "risk_grade": GRADE_DB_LABEL[grade],
+        "memo": memo,
+    }
+
+
+def load_tasks_from_db():
+    """DB에서 전체 작업을 읽어 리스트로 반환. 실패 시 None (오류는 session_state['db_error'])"""
+    sb = get_supabase()
+    if sb is None:
+        return None
+    try:
+        try:
+            res = sb.table(DB_TABLE).select("*").order("id").execute()
+        except Exception:
+            res = sb.table(DB_TABLE).select("*").execute()
+        st.session_state["db_error"] = ""
+        return [_row_to_task(r, i) for i, r in enumerate(res.data or [], 1)]
+    except Exception as e:
+        st.session_state["db_error"] = str(e)[:200]
+        return None
+
+
+def refresh_tasks_from_db() -> bool:
+    tasks = load_tasks_from_db()
+    st.session_state["db_ok"] = tasks is not None
+    if tasks is not None:
+        st.session_state["tasks"] = tasks
+        return True
+    return False
+
+
+def db_insert_tasks(tasks: list) -> tuple:
+    """DB 모드에서 작업 여러 건을 한 번에 저장합니다. (ok, 오류메시지)"""
+    try:
+        get_supabase().table(DB_TABLE).insert([_task_to_row(t) for t in tasks]).execute()
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def db_delete_task(task: dict) -> tuple:
+    task_id = task.get("id")
+    if task_id is None:
+        return False, "행 id가 없어 삭제할 수 없습니다."
+    try:
+        res = get_supabase().table(DB_TABLE).delete().eq("id", task_id).execute()
+        if not res.data:
+            return False, "삭제된 행이 없습니다. Supabase RLS의 delete 정책을 확인하세요."
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def db_clear_all() -> tuple:
+    try:
+        sb = get_supabase()
+        ids = [r["id"] for r in (sb.table(DB_TABLE).select("id").execute().data or [])]
+        if ids:
+            res = sb.table(DB_TABLE).delete().in_("id", ids).execute()
+            if not res.data:
+                return False, "삭제된 행이 없습니다. Supabase RLS의 delete 정책을 확인하세요."
+        return True, ""
+    except Exception as e:
+        return False, str(e)[:200]
+
+
+def add_task(task: dict) -> tuple:
+    """작업 1건 추가: DB 모드면 클라우드에 저장 후 재조회, 아니면 세션에만 추가"""
+    if not db_active():
+        st.session_state["tasks"].append(task)
+        return True, ""
+    ok, err = db_insert_tasks([task])
+    if ok:
+        refresh_tasks_from_db()
+    return ok, err
+
+
+def replace_all_tasks(tasks: list) -> tuple:
+    """전체 교체 (샘플 복원·CSV 가져오기·전체 삭제용)"""
+    if not db_active():
+        st.session_state["tasks"] = tasks
+        return True, ""
+    ok, err = db_clear_all()
+    if ok and tasks:
+        ok, err = db_insert_tasks(tasks)
+    refresh_tasks_from_db()
+    return ok, err
+
+
 def init_session_state():
-    """Streamlit 세션 상태를 초기화하고 기본 샘플 데이터를 적재합니다."""
+    """세션 상태를 초기화합니다. Supabase가 연결되면 DB 데이터를, 아니면 샘플을 적재합니다."""
     if "tasks" not in st.session_state:
-        st.session_state["tasks"] = get_sample_tasks()
-        
+        st.session_state["db_error"] = ""
+        if not refresh_tasks_from_db():
+            st.session_state["tasks"] = get_sample_tasks()
+
     if "checked_rules" not in st.session_state:
         st.session_state["checked_rules"] = set()
 
@@ -668,28 +832,51 @@ def render_sidebar():
                         "risk_grade": grade,
                         "description": description.strip() if description else "",
                     }
-                    st.session_state["tasks"].append(new_task)
-                    st.success(f"✅ '{task_name}' 작업이 성공적으로 추가되었습니다!")
-                    st.rerun()
+                    ok, err = add_task(new_task)
+                    if not ok:
+                        st.error(f"☁️ 클라우드 저장에 실패했습니다: {err}")
+                    else:
+                        st.toast(f"✅ '{task_name}' 작업이 추가되었습니다!")
+                        st.rerun()
 
         st.markdown("---")
         st.markdown("### ⚙️ 데이터 관리")
 
+        if db_active():
+            st.caption("☁️ Supabase 연결됨 — 웹/모바일 데이터가 공유됩니다.")
+        elif get_supabase() is not None:
+            st.warning(f"⚠️ Supabase 조회 실패 → 로컬 모드: {st.session_state.get('db_error', '')}")
+        else:
+            st.caption("💻 로컬 모드 (Supabase 미연결 — 새로고침하면 데이터가 사라집니다)")
+
+        if get_supabase() is not None:
+            if st.button("☁️ 클라우드에서 새로고침", use_container_width=True):
+                if refresh_tasks_from_db():
+                    st.toast("최신 데이터를 불러왔습니다.")
+                st.rerun()
+
         col_btn1, col_btn2 = st.columns(2)
         with col_btn1:
             if st.button("🔄 샘플 복원", use_container_width=True, help="기본 시나리오 5개 데이터로 재설정합니다."):
-                st.session_state["tasks"] = get_sample_tasks()
+                ok, err = replace_all_tasks(get_sample_tasks())
                 st.session_state["checked_rules"] = set()
-                st.rerun()
+                if ok:
+                    st.rerun()
+                else:
+                    st.error(f"☁️ 처리 실패: {err}")
         with col_btn2:
             if st.button("🗑️ 전체 삭제", use_container_width=True, help="등록된 모든 작업을 삭제합니다."):
-                st.session_state["tasks"] = []
+                ok, err = replace_all_tasks([])
                 st.session_state["checked_rules"] = set()
-                st.rerun()
+                if ok:
+                    st.rerun()
+                else:
+                    st.error(f"☁️ 처리 실패: {err}")
 
         # CSV 업로드 기능
         uploaded_file = st.file_uploader("📥 작업 CSV 파일 가져오기", type=["csv"])
-        if uploaded_file is not None:
+        csv_key = f"{uploaded_file.name}-{uploaded_file.size}" if uploaded_file is not None else None
+        if uploaded_file is not None and st.session_state.get("last_csv") != csv_key:
             try:
                 csv_df = pd.read_csv(uploaded_file)
                 required_cols = {"task_name", "x_coord", "y_coord", "likelihood", "severity"}
@@ -712,9 +899,13 @@ def render_sidebar():
                             "risk_grade": grade,
                             "description": str(row.get("description", "")),
                         })
-                    st.session_state["tasks"] = imported_tasks
-                    st.success(f"총 {len(imported_tasks)}건의 작업 데이터를 불러왔습니다.")
-                    st.rerun()
+                    st.session_state["last_csv"] = csv_key
+                    ok, err = replace_all_tasks(imported_tasks)
+                    if ok:
+                        st.toast(f"총 {len(imported_tasks)}건의 작업 데이터를 불러왔습니다.")
+                        st.rerun()
+                    else:
+                        st.error(f"☁️ 클라우드 저장에 실패했습니다: {err}")
             except Exception as e:
                 st.error(f"CSV 파일 파싱 중 오류가 발생했습니다: {str(e)}")
 
@@ -908,14 +1099,26 @@ def render_data_table(df: pd.DataFrame):
             selected_task = st.selectbox("삭제할 작업을 선택하세요", task_options)
             if st.button("선택한 작업 삭제", type="secondary", use_container_width=True):
                 target_step = int(selected_task.split("]")[0].replace("[", ""))
-                st.session_state["tasks"] = [
-                    t for t in st.session_state["tasks"] if t.get("step_no") != target_step
-                ]
-                # 순번 재정렬
-                for new_idx, t in enumerate(st.session_state["tasks"], 1):
-                    t["step_no"] = new_idx
-                st.success("해당 작업이 삭제되었습니다.")
-                st.rerun()
+                target = next(
+                    (t for t in st.session_state["tasks"] if t.get("step_no") == target_step), None
+                )
+                if db_active():
+                    ok, err = db_delete_task(target) if target else (False, "대상을 찾을 수 없습니다.")
+                    if ok:
+                        refresh_tasks_from_db()
+                else:
+                    st.session_state["tasks"] = [
+                        t for t in st.session_state["tasks"] if t.get("step_no") != target_step
+                    ]
+                    # 순번 재정렬
+                    for new_idx, t in enumerate(st.session_state["tasks"], 1):
+                        t["step_no"] = new_idx
+                    ok, err = True, ""
+                if ok:
+                    st.toast("해당 작업이 삭제되었습니다.")
+                    st.rerun()
+                else:
+                    st.error(f"☁️ 삭제 실패: {err}")
 
 
 # ==============================================================================
@@ -989,67 +1192,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-import os
-import pandas as pd
-import plotly.express as px
-import streamlit as st
-from supabase import create_client
-
-# Supabase 클라우드 연결 설정 (Streamlit Secrets 또는 환경 변수 활용)
-import os
-
-try:
-    SUPABASE_URL = st.secrets["SUPABASE_URL"]
-    SUPABASE_KEY = st.secrets["SUPABASE_KEY"]
-except Exception:
-    SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-    SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-st.set_page_config(page_title="StageGuard Cloud", layout="wide")
-st.title("🎭 StageGuard Cloud: 무대 설비 작업 위험성 평가 및 동선 시뮬레이터")
-
-st.sidebar.header("📋 작업 및 위험성 평가 입력")
-
-with st.sidebar.form("risk_form"):
-  task_name = st.text_input(
-      "작업명 (예: 조명 바텐 승하강, 음향 스피커 설치)"
-  )
-  x_coord = st.slider("무대 X 좌표 (m)", 0.0, 20.0, 10.0)
-  y_coord = st.slider("무대 Y 좌표 (m)", 0.0, 15.0, 7.5)
-  likelihood = st.number_input("가능성 (Likelihood, 1~5)", 1, 5, 3)
-  severity = st.number_input("중대성 (Severity, 1~5)", 1, 5, 3)
-  memo = st.text_area("현장 안전 특이사항 및 조치 계획")
-
-  submitted = st.form_submit_button("위험성 평가 등록")
-
-if submitted:
-  score = likelihood * severity
-  if score >= 15:
-    grade = "Red (고위험)"
-  elif score >= 8:
-    grade = "Yellow (중위험)"
-  else:
-    grade = "Green (저위험)"
-
-  # Supabase 데이터 삽입
-  data = {
-      "task_name": task_name,
-      "x_coord": x_coord,
-      "y_coord": y_coord,
-      "likelihood": likelihood,
-      "severity": severity,
-      "risk_score": score,
-      "risk_grade": grade,
-      "memo": memo,
-  }
-
-  response = supabase.table("risk_assessments").insert(data).execute()
-  st.success(
-      f"작업 [{task_name}] 클라우드 등록 완료! (위험 점수: {score}, 등급:"
-      f" {grade})"
-  )
-  st.rerun()
-  
